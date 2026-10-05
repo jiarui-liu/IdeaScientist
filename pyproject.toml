@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ideascientist"
+version = "1.0.0"
+description = "IdeaScientist: Orchestrating Agents for Grounded Scientific Ideation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "CC-BY-NC-4.0" }
+dependencies = [
+    "numpy>=1.24",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+vault = [
+    "arxiv>=2.1",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "pymupdf>=1.24",
+]
+embed = [
+    "torch>=2.4",
+    "transformers>=4.51",
+    "sentence-transformers>=3.0",
+]
+analysis = [
+    "pandas>=2.0",
+    "matplotlib>=3.8",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["ideascientist*"]
+
+[tool.setuptools.package-data]
+ideascientist = ["**/*.txt", "**/*.yaml", "**/*.json", "**/*.jinja"]

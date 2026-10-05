@@ -1,0 +1,402 @@
+# GRPO configuration for the gap finder.
+#
+# Matches the setup reported in the paper appendix: LoRA rank 32, alpha 64, no
+# dropout, on all linear modules except the output projection; AdamW at a
+# constant 5e-6 with weight decay 0.01 and gradient clipping at 1.0; bfloat16
+# with tensor parallel 8; 64 prompts x 8 generations = 512 rollouts per step,
+# chunked into gradient updates of 256; an asymmetric probability ratio clip of
+# [0.2, 0.28] with no KL penalty; and asynchronous GRPO at a maximum policy
+# staleness of one step with the corresponding importance-sampling correction.
+#
+# Sequence length and training limits are per role: this one uses 26,624 tokens
+# for up to 2 epochs or 800 steps.
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8
+  max_rollout_turns: 15
+  max_num_epochs: 2
+  max_num_steps: 800
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 1
+  val_at_start: true
+  val_at_end: true
+  overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
+  max_val_samples: 32
+  val_batch_size: 32
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  adv_estimator:
+    name: grpo
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+  use_cispo: false
+  disable_ppo_ratio: false
+  positive_example_nll_weight: 0.0
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:IDEASCIENTIST_RUN_DIR,runs/gap_finder}/checkpoints
+  metric_name: val:accuracy
+  higher_is_better: true
+  keep_top_k: 5
+  save_period: 1
+  checkpoint_must_save_by: null
+  model_save_format: safetensors
+  save_consolidated: false
+  save_optimizer: true
+policy:
+  model_name: ${oc.env:IDEASCIENTIST_POLICY_MODEL,Qwen/Qwen3.6-27B}
+  tokenizer:
+    name: ${oc.env:IDEASCIENTIST_POLICY_MODEL,Qwen/Qwen3.6-27B}
+    chat_template_kwargs:
+      enable_thinking: true
+  hf_config_overrides: {}
+  # Collected rollouts/step = num_prompts_per_step*num_generations_per_prompt =
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  generation_batch_size: 256
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 26624
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: true
+    sequence_parallel: true
+    activation_checkpointing: true
+    clear_cache_every_n_steps: null
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    # TP=8: MLP + lm_head sharded in the custom plan (see training/tp_plan.py).
+    tensor_parallel_size: 8
+    context_parallel_size: 1
+    custom_parallel_plan: ideascientist.training.tp_plan.qwen3_5_tp_plan
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: true
+      target_modules: []
+      exclude_modules: ['*lm_head*', '*visual*']
+      match_all_linear: false
+      dim: 32
+      alpha: 64
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init: xavier
+      use_triton: false
+  megatron_cfg:
+    enabled: false
+    force_reconvert_from_hf: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    recompute_granularity: full
+    recompute_modules: null
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    defer_fp32_logits: false
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: false
+    gradient_accumulation_fusion: false
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      a2a_experimental: false
+      lora_dtype: None
+    optimizer:
+      optimizer: adam
+      lr: 5.0e-06
+      min_lr: 5.0e-07
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 1000
+      lr_warmup_iters: 0  # no LR warmup (was 13)
+      lr_warmup_init: 5.0e-06  # = lr (no warmup ramp)
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+    env_vars: null
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 8
+  max_grad_norm: 1.0
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-06
+      weight_decay: 0.01
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0  # no LR warmup (was 0.1) — constant LR from step 0
+      end_factor: 1.0
+      total_iters: 20
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 20
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: vllm
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    stop_token_ids: null
+    stop_strings: null
+    mcore_generation_config:
+      async_engine: false
+      max_model_len: ${policy.max_total_sequence_length}
+      cuda_graph_impl: local
+      inference_cuda_graph_scope: block
+      buffer_size_gb: 10
+      num_cuda_graphs: 4
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      enable_prefix_caching: false
+      max_tokens: 16384
+      kv_cache_management_mode: persist
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: nvshmem
+      parsers: []
+      expose_http_server: false
+    vllm_cfg:
+      # LAYER 1 (generation/reading OVERLAP) TOGGLE. true => grpo_train dispatches
+      # Switches the vLLM worker to VllmAsyncGenerationWorker + generate_async;
+      # (NRL_REFIT_BUFFER_MEMORY_RATIO / gpu_memory_utilization unchanged).
+      async_engine: true
+      # Weight refits can leave prefix-cache blocks referenced even after all
+      enable_prefix_caching: false
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      # -> 0.5. (2) TRAIN BACKWARD (vLLM ASLEEP): the vocab-parallel logprob-gradient
+      # IRREDUCIBLE by IDEASCIENTIST_LOGPROB_CHUNK (that bounds the per-iter fp32 loop
+      # 0.3 (from 0.5) frees the most reservation for the trainer's backward while KV
+      gpu_memory_utilization: 0.3
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+      use_tqdm: true
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      disable_custom_all_reduce: true
+    vllm_kwargs:
+      disable_custom_all_reduce: true
+      max_num_seqs: 64
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: ideascientist.training.data.AgentDataset
+    data_path: ${oc.env:IDEASCIENTIST_GRPO_DATA,data/grpo/gap_finder}/train.jsonl
+    input_key: input
+    output_key: output
+    split_validation_size: 0
+  validation:
+    dataset_name: ideascientist.training.data.AgentDataset
+    data_path: ${oc.env:IDEASCIENTIST_GRPO_DATA,data/grpo/gap_finder}/validation.jsonl
+    input_key: input
+    output_key: output
+  default:
+    dataset_name: ideascientist.training.data.AgentDataset
+    input_key: input
+    output_key: output
+    prompt_file: null
+    system_prompt_file: null
+    processor: gap_finder_data_processor
+    env_name: gap_finder
+env:
+  gap_finder:
+    num_workers: 8
+    db_path: ${oc.env:IDEA_VAULT_DB,data/idea_vault.db}
+    output_dir: ${oc.env:IDEASCIENTIST_RUN_DIR,runs/gap_finder}
+    judge_base_url: http://localhost:8000/v1
+    # Cross-node judge discovery. Reuse the served Qwen3.6-27B endpoint pool: one
+    judge_server_dir: ${oc.env:IDEASCIENTIST_JUDGE_SERVER_DIR,}
+    judge_model: ${oc.env:IDEASCIENTIST_POLICY_MODEL,Qwen/Qwen3.6-27B}
+    judge_api_key: EMPTY
+    judge_extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+      temperature: 0.7
+      top_p: 0.80
+      top_k: 20
+      min_p: 0.0
+      presence_penalty: 1.5
+      repetition_penalty: 1.0
+    max_phase_turns: 20
+    reward_weights:
+      rubric: 0.85
+      process: 0.15
+      # Relative weights of the three components inside the rubric reward. Only
+      # (base + reference + citation) / 3 average. Set any to 0.0 to disable it.
+      base_quality: 1.0
+      reference_quality: 1.0
+      citation_f1: 1.0
+logger:
+  log_dir: ${oc.env:IDEASCIENTIST_RUN_DIR,runs/gap_finder}
+  num_val_samples_to_print: 4
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: ideascientist
+    name: ideascientist-gap-finder
+  swanlab:
+    project: grpo-dev
+    name: grpo-dev-logger
+  tensorboard: {}
+  mlflow:
+    experiment_name: grpo-dev
+    run_name: grpo-dev-logger
+    tracking_uri: http://localhost:5000
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 8
+  # 8 training nodes x 8 H100 = 64 world. Colocated GRPO builds ONE worker group
+  num_nodes: 8
+  master_port_range_low: 25000
+  master_port_range_high: 28000
+data_plane:
+  enabled: false
+  impl: transfer_queue
+  backend: simple
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888
+  local_buffer_size: 68719476736

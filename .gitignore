@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# Data and run artifacts are never committed.
+data/
+runs/
+logs/
+checkpoints/
+wandb/
+*.db
+*.db-wal
+*.db-shm
+*.npy
+*.jsonl
+*.parquet
