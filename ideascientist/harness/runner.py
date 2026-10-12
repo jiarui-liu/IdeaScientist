@@ -25,7 +25,7 @@ from ideascientist.harness import tools as T
 from ideascientist.harness.client import AgenticLLMClient
 from ideascientist.harness.orchestrator import orchestrator_prompt
 from ideascientist.harness.runlog import RunLogger, SharedLogRegistry
-from ideascientist.utils.llm import DEFAULT_BASE_URL, context_window_for
+from ideascientist.utils.llm import DEFAULT_BASE_URL, DEFAULT_MODEL, context_window_for
 
 
 def _api_key() -> str:
@@ -351,6 +351,7 @@ def build_reader_task(paper_id, goals: list, prior_digest: str = "") -> str:
     from ideascientist.harness import corpus as C
     from ideascientist.harness.tools import FULLTEXT_CHAR_LIMIT
 
+    _tok_cap = READER_INPUT_TOKEN_CAP
     pid = int(paper_id)
     goal_lines = "\n".join(f"- {g}" for g in goals) or \
         "- summarize the paper's method, key results, and stated limitations"
@@ -358,7 +359,7 @@ def build_reader_task(paper_id, goals: list, prior_digest: str = "") -> str:
     # Pre-fetch body + biblio (cheap local DB reads; the LLM cost is the prefill,
     # which prefix-caching now shares across generations).
     try:
-        raw_fulltext = C.get_stored_full_text(paper_id=pid, key="") or ""
+        raw_fulltext = C.get_stored_full_text(paper_id=pid) or ""
         # Head-and-tail truncation: the intro, method, conclusion and limitations
         # are where a gap claim is grounded, and plain end-truncation would cut the
         # limitations first. 0 disables and falls back to the character cap.
@@ -638,6 +639,7 @@ async def run_ideation(
     max_turns: int = 100,
     max_sub_turns: int = 40,
 ) -> dict:
+    model = model or os.environ.get("IDEASCIENTIST_MODEL") or DEFAULT_MODEL
     run_dir = Path(run_dir).resolve()
     docs_dir = run_dir / "outputs"   # agent-written working docs
     logs_dir = run_dir / "logs"      # debug logs (harness_log/llm_calls/summary/_sublogs)
@@ -668,6 +670,7 @@ async def run_ideation(
     # short-circuiting on cache, so it can reuse already-answered goals and append
     # only the new ones.
     reader_acc = {"tokens": 0, "calls": 0, "n": 0, "parser_retries": 0}
+    _reader_lock = threading.Lock()
 
     def _read_paper(paper_id: int, goals: list) -> str:
         digest_path = docs_dir / "papers" / f"{paper_id}.md"
