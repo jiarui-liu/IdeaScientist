@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import os
 import threading
@@ -23,6 +24,7 @@ from typing import Optional
 
 from ideascientist.harness import tools as T
 from ideascientist.harness.client import AgenticLLMClient
+from ideascientist.harness.checkpoint import Checkpoint, CheckpointError, runtime_config
 from ideascientist.harness.orchestrator import orchestrator_prompt
 from ideascientist.harness.runlog import RunLogger, SharedLogRegistry
 from ideascientist.utils.llm import DEFAULT_BASE_URL, context_window_for
@@ -139,6 +141,23 @@ def _log_heartbeat(log, prompt_tokens, window):
                   window=window, heartbeat=hb)
 
 
+def _record(scope, key, request, fn):
+    return scope.call(key, request, fn) if scope is not None else fn()
+
+
+def _chat(scope, key, client, messages, tools):
+    if scope is not None:
+        return scope.chat(key, client, messages, tools)
+    return client.chat(messages, tools=tools)
+
+
+def _execute_tool(ctx, key, fn, args, tool_call_id):
+    scope = ctx.checkpoint.child(key) if ctx.checkpoint is not None else None
+    call_ctx = dataclasses.replace(ctx, checkpoint=scope)
+    return _record(scope, "result", [fn, args, tool_call_id],
+                   lambda: T.run_tool(fn, args, call_ctx, tool_call_id=tool_call_id))
+
+
 def _needs_artifact_nudge(ctx, required_artifact) -> bool:
     """True iff ``required_artifact`` is set but not yet written on disk with at least
     ``T.ARTIFACT_MIN_CHARS`` non-whitespace chars. Reads from the same docs dir that
@@ -211,14 +230,15 @@ def _tool_loop(client, messages, tools, ctx, log, step_prefix, max_turns,
         _log_heartbeat(log, client.last_prompt_tokens, window)
         # Neither loop compacts its history: the GRPO environment does not, so
         # condensing here would make served transcripts diverge from trained ones.
-        msg = client.chat(messages, tools=tools)["choices"][0]["message"]
+        msg = _chat(ctx.checkpoint, f"chat:{t}", client, messages, tools)["choices"][0]["message"]
         messages.append(msg)
         tcs = msg.get("tool_calls") or []
         if not tcs:
             # Phase-completion gate (train/deploy parity): the model wants to finish.
             # If a required artifact is not yet written, nudge (up to T.MAX_PHASE_NUDGES)
             # instead of terminating — matches agent_environment._process_episode_turn.
-            if _needs_artifact_nudge(ctx, required_artifact) and phase_nudges < T.MAX_PHASE_NUDGES:
+            if _record(ctx.checkpoint, f"gate:{t}", required_artifact,
+                       lambda: _needs_artifact_nudge(ctx, required_artifact)) and phase_nudges < T.MAX_PHASE_NUDGES:
                 phase_nudges += 1
                 messages.append({"role": "user", "content": T.artifact_nudge(required_artifact)})
                 log.event("phase_nudge", step=step_prefix, artifact=required_artifact,
@@ -267,11 +287,13 @@ def _tool_loop(client, messages, tools, ctx, log, step_prefix, max_turns,
                         pid = T.coerce_paper_id(fargs)
                         if pid is not None and pid in goal_union:
                             fargs = {**fargs, "goals": goal_union[pid]}
-                    res = T.run_tool(fn, fargs, ctx, tool_call_id=tc["id"])
+                    res = _execute_tool(ctx, f"tool:{t}:{i}", fn, fargs, tc["id"])
                     if fn in T.FULLTEXT_TOOLS:
                         ft_used += 1
                     if fn == T.READ_PAPER_TOOL:
                         rp_used += 1
+                except CheckpointError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     res = f"ERROR in {fn}: {exc}"
                     log.event("tool_error", tool=fn, error=str(exc), tool_call_id=tc["id"])
@@ -436,7 +458,8 @@ def build_reader_task(paper_id, goals: list, prior_digest: str = "") -> str:
 
 
 def read_paper_single_turn(paper_id, goals: list, prior_digest: str = "", *,
-                           model, base_url=None, api_key=None, run_dir=None) -> str:
+                           model, base_url=None, api_key=None, run_dir=None,
+                           checkpoint=None, usage=None, log_dir=None) -> str:
     """Read one paper in a single completion, as reported in the paper.
 
     The model gets the full text and the goals and answers them directly; the
@@ -449,7 +472,8 @@ def read_paper_single_turn(paper_id, goals: list, prior_digest: str = "", *,
     from ideascientist.harness.thinking import after_think
 
     pid = int(paper_id)
-    task = build_reader_task(pid, goals, prior_digest)  # fulltext + digest + goals block
+    task = _record(checkpoint, "task", [pid, goals, prior_digest],
+                   lambda: build_reader_task(pid, goals, prior_digest))
     # The "output NONE" escape hatch is ONLY valid when a prior digest exists (the
     # append/re-read case: the goals may already be covered). On a FIRST read the digest
     # is empty, so NONE is logically impossible — and offering it anyway gives the
@@ -490,9 +514,15 @@ def read_paper_single_turn(paper_id, goals: list, prior_digest: str = "", *,
     client = AgenticLLMClient(
         api_key=api_key or _api_key(), model=model, base_url=burl,
         text_tools=False, max_tokens=rmt, extra_body=eb,
-        log_dir=_reader_log_dir,
+        log_dir=log_dir or _reader_log_dir,
     )
-    resp = client.chat(messages, tools=[])
+    client.set_step(checkpoint.name if checkpoint is not None else f"reader:{pid}")
+    try:
+        resp = _chat(checkpoint, "chat", client, messages, [])
+        if usage is not None:
+            usage.update(client.summary())
+    finally:
+        client.close()
     # chat() returns the raw OpenAI-style response dict -> choices[0].message.content
     content = ""
     if isinstance(resp, dict):
@@ -525,6 +555,8 @@ def _run_subagent(role, task, ctx, model, log, log_key, conversation_id,
     that bypass the process-global lookups, which is what lets N subagents target
     N different servers at once.
     """
+    if ctx.checkpoint is not None:
+        ctx = dataclasses.replace(ctx, checkpoint=ctx.checkpoint.child(conversation_id))
     if role not in T.ROLES:
         return {"role": role, "digest": f"(unknown role: {role})", "tokens": 0, "calls": 0}
     # Subagents own the files they produce, so they run with the FULL write allowlist
@@ -557,8 +589,10 @@ def _run_subagent(role, task, ctx, model, log, log_key, conversation_id,
     shared_log = None
     client_kwargs = {}
     if ctx.log_registry is not None:
-        log_path = ctx.run_dir / "logs" / "_sublogs" / f"{log_key}.json"
-        shared_log = ctx.log_registry.acquire(log_path, conversation_id)
+        log_root = log.run_dir if ctx.checkpoint is not None else ctx.run_dir / "logs"
+        log_path = log_root / "_sublogs" / f"{log_key}.json"
+        log_conversation = ctx.checkpoint.name if ctx.checkpoint is not None else conversation_id
+        shared_log = ctx.log_registry.acquire(log_path, log_conversation)
     else:
         client_kwargs["log_dir"] = ctx.run_dir / "logs" / "_sublogs" / conversation_id.replace("#", "_")
     # The paper reader is an untrained extraction tool, so reasoning tokens it
@@ -605,6 +639,8 @@ def _run_subagent(role, task, ctx, model, log, log_key, conversation_id,
         max_tokens=_eff_max_tokens,  # long sections fit in one call; client auto-caps to context
         shared_log=shared_log, extra_body=extra_body, **client_kwargs,
     )
+    if ctx.checkpoint is not None:
+        ctx.checkpoint.checkpoint.resources.callback(client.close)
     user_content = task
     if role in T.PROBLEM_CONTEXT_ROLES:
         user_content = T.build_subagent_user_message(task, ctx.query_text)
@@ -629,7 +665,7 @@ def _run_subagent(role, task, ctx, model, log, log_key, conversation_id,
             "retries_on_parser_error": s.get("total_retries_on_parser_error", 0)}
 
 
-async def run_ideation(
+async def _run_ideation(
     problem: str,
     run_dir: str | Path,
     *,
@@ -637,16 +673,28 @@ async def run_ideation(
     query_paper_id: Optional[int] = None,
     max_turns: int = 100,
     max_sub_turns: int = 40,
+    checkpoint=None,
 ) -> dict:
     run_dir = Path(run_dir).resolve()
     docs_dir = run_dir / "outputs"   # agent-written working docs
     logs_dir = run_dir / "logs"      # debug logs (harness_log/llm_calls/summary/_sublogs)
     (docs_dir / "papers").mkdir(parents=True, exist_ok=True)
+    if checkpoint is not None:
+        cp = checkpoint.checkpoint
+        attempt = (cp.get("attempt") or 0) + 1
+        cp.set("attempt", attempt)
+        if attempt > 1:
+            logs_dir = logs_dir / f"attempt_{attempt:04d}"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log = RunLogger(logs_dir)
     log_registry = SharedLogRegistry()
     log.event("run_start", model=model, query_paper_id=query_paper_id)
-    (docs_dir / "problem.md").write_text(problem, encoding="utf-8")
+    if checkpoint is not None:
+        cp.resources.callback(log.close)
+        cp.resources.callback(log_registry.close_all)
+        checkpoint.write("problem", "problem.md", problem)
+    else:
+        (docs_dir / "problem.md").write_text(problem, encoding="utf-8")
 
     orch_sys = orchestrator_prompt(
         write_hint="edit_doc(command='view'|'create'|'str_replace'|'insert', path, ...)",
@@ -661,53 +709,68 @@ async def run_ideation(
                               extra_body={"chat_template_kwargs": {"enable_thinking": True}})
     ctx = T.ToolContext(run_dir=run_dir, docs_dir=docs_dir,
                         query_paper_id=query_paper_id, query_text=problem, log=log,
-                        log_registry=log_registry)
+                        log_registry=log_registry, checkpoint=checkpoint)
+    if checkpoint is not None:
+        cp.resources.callback(client.close)
 
     # read_paper runs a reader over the raw full text in its own context and
     # returns the cumulative digest. Every call invokes the reader rather than
     # short-circuiting on cache, so it can reuse already-answered goals and append
     # only the new ones.
     reader_acc = {"tokens": 0, "calls": 0, "n": 0, "parser_retries": 0}
+    _reader_lock = threading.Lock()
 
-    def _read_paper(paper_id: int, goals: list) -> str:
+    def _read_paper(paper_id: int, goals: list, *, checkpoint=None) -> str:
         digest_path = docs_dir / "papers" / f"{paper_id}.md"
         with _reader_lock:
             reader_acc["n"] += 1
             idx = reader_acc["n"]
-        # The digest persists on disk across calls and is injected into the task,
-        # so the reader never spends a turn viewing it first.
-        prior = ""
+        prior = _record(checkpoint, "prior", paper_id,
+                        lambda: digest_path.read_text(encoding="utf-8").strip()
+                        if digest_path.exists() else "")
+        stats = {"n": 1, "tokens": 0, "calls": 0, "parser_retries": 0}
         try:
-            if digest_path.exists():
-                prior = digest_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            prior = ""
-        task = build_reader_task(paper_id, goals, prior)
-        # Single-turn by default, matching the reported setup and the training
-        # environment. Set the variable to 0 for the agentic reader instead.
-        if os.environ.get("IDEASCIENTIST_READER_SINGLE_TURN", "1").strip().lower() not in ("0", "false", "no"):
-            content = read_paper_single_turn(paper_id, goals, prior, model=model,
-                                             base_url=None, api_key=None, run_dir=run_dir)
-            new_digest = (prior + "\n\n" + content).strip() if (prior and content) else (content or prior).strip()
-            try:
-                digest_path.parent.mkdir(parents=True, exist_ok=True)
-                digest_path.write_text(new_digest, encoding="utf-8")
-            except OSError:
-                pass
-            return new_digest or "(reader produced no digest)"
-        r = _run_subagent("paper_reader", task, ctx, model, log,
-                          log_key=f"paper_{paper_id}",
-                          conversation_id=f"{paper_id}#{idx}",
-                          max_sub_turns=None, solo_first_turn=False)
-        with _reader_lock:
-            reader_acc["tokens"] += r.get("tokens", 0)
-            reader_acc["calls"] += r.get("calls", 0)
-            reader_acc["parser_retries"] += r.get("retries_on_parser_error", 0)
-        if digest_path.exists():
-            content = digest_path.read_text(encoding="utf-8")
-            if content.strip():
-                return content
-        return r.get("digest", "(reader produced no digest)")
+            if os.environ.get("IDEASCIENTIST_READER_SINGLE_TURN", "1").strip().lower() not in ("0", "false", "no"):
+                usage = {}
+                content = read_paper_single_turn(
+                    paper_id, goals, prior, model=model, run_dir=run_dir,
+                    checkpoint=checkpoint, usage=usage,
+                    log_dir=logs_dir / "_sublogs" / "reader_single_turn" /
+                    (str(paper_id) + "_" + (str(idx) if checkpoint is None else
+                     hashlib.sha256(checkpoint.name.encode()).hexdigest()[:16])))
+                new_digest = (prior + "\n\n" + content).strip() if (prior and content) else (content or prior).strip()
+                if checkpoint is not None:
+                    checkpoint.write("digest", f"papers/{paper_id}.md", new_digest)
+                else:
+                    digest_path.parent.mkdir(parents=True, exist_ok=True)
+                    digest_path.write_text(new_digest, encoding="utf-8")
+                stats.update(tokens=usage.get("total_tokens", 0), calls=usage.get("total_calls", 0),
+                             parser_retries=usage.get("total_retries_on_parser_error", 0))
+                result = new_digest or "(reader produced no digest)"
+            else:
+                task = _record(checkpoint, "task", [paper_id, goals, prior],
+                               lambda: build_reader_task(paper_id, goals, prior))
+                reader_ctx = dataclasses.replace(ctx, checkpoint=checkpoint)
+                r = _run_subagent("paper_reader", task, reader_ctx, model, log,
+                                  log_key=f"paper_{paper_id}",
+                                  conversation_id="reader" if checkpoint is not None else f"{paper_id}#{idx}",
+                                  max_sub_turns=None, solo_first_turn=False)
+                stats.update(tokens=r.get("tokens", 0), calls=r.get("calls", 0),
+                             parser_retries=r.get("retries_on_parser_error", 0))
+                result = _record(checkpoint, "digest_result", paper_id,
+                                 lambda: (digest_path.read_text(encoding="utf-8")
+                                          if digest_path.exists() else "") or r["digest"])
+        except Exception as exc:
+            if checkpoint is not None:
+                raise CheckpointError("Paper reader interrupted; resume this run to retry.") from exc
+            raise
+        if checkpoint is not None:
+            checkpoint.checkpoint.set("reader:" + checkpoint.name, stats)
+        else:
+            with _reader_lock:
+                for k in ("tokens", "calls", "parser_retries"):
+                    reader_acc[k] += stats[k]
+        return result
 
     ctx.reader_fn = _read_paper
 
@@ -736,7 +799,7 @@ async def run_ideation(
         # (train/deploy parity — no [budget] line). Shows the orchestrator's OWN usage.
         _log_heartbeat(log, client.last_prompt_tokens, window)
         client.set_step(f"orch:{turn}")
-        msg = client.chat(messages, tools=orch_tools)["choices"][0]["message"]
+        msg = _chat(checkpoint, f"chat:{turn}", client, messages, orch_tools)["choices"][0]["message"]
         messages.append(msg)
         tcs = msg.get("tool_calls") or []
         if not tcs:
@@ -744,7 +807,8 @@ async def run_ideation(
             # analysis-only with NO tool call before the report exists, which would end
             # the run with no report.json. If the final artifact isn't produced yet and
             # nudges remain, inject a continue-nudge and keep going instead of ending.
-            if not (docs_dir / "report.json").exists() and orch_nudges < MAX_ORCH_NUDGES:
+            if _record(checkpoint, f"gate:{turn}", None,
+                       lambda: not (docs_dir / "report.json").exists()) and orch_nudges < MAX_ORCH_NUDGES:
                 orch_nudges += 1
                 log.event("orch_nudge", turn=turn, n=orch_nudges, reason="no_tool_calls_before_report")
                 messages.append({"role": "user", "content": (
@@ -759,7 +823,7 @@ async def run_ideation(
 
         results: dict[str, str] = {}
         spawns = []  # (tool_call_id, coroutine)
-        for tc in tcs:
+        for i, tc in enumerate(tcs):
             n_tool_calls += 1
             fn = tc["function"]["name"]
             fargs, perr = _parse_tool_args(tc)
@@ -789,14 +853,28 @@ async def run_ideation(
                     max_sub_turns)))
             else:
                 try:
-                    results[tc["id"]] = T.run_tool(fn, fargs, ctx, tool_call_id=tc["id"])
+                    results[tc["id"]] = _execute_tool(ctx, f"tool:{turn}:{i}", fn, fargs, tc["id"])
+                except CheckpointError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     results[tc["id"]] = f"ERROR in {fn}: {exc}"
                     log.event("tool_error", tool=fn, error=str(exc), tool_call_id=tc["id"])
 
         if spawns:  # run all subagents of this turn concurrently
-            done = await asyncio.gather(*[c for _, c in spawns], return_exceptions=True)
+            pending = asyncio.gather(*[c for _, c in spawns], return_exceptions=True)
+            try:
+                done = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # to_thread cannot cancel an HTTP request. Keep the journal and
+                # lock alive until in-flight calls are saved, then stop workers
+                # before they start another unrecorded operation.
+                if checkpoint is not None:
+                    cp.stopping.set()
+                await pending
+                raise
             for (tid, _), r in zip(spawns, done):
+                if isinstance(r, BaseException) and (checkpoint is not None or not isinstance(r, Exception)):
+                    raise r
                 if isinstance(r, Exception):
                     results[tid] = f"ERROR in subagent: {r}"
                     log.event("tool_error", tool="spawn_subagent", error=str(r))
@@ -819,6 +897,8 @@ async def run_ideation(
     orch = client.summary()
     orch_parser_retries = orch.get("total_retries_on_parser_error", 0)
     # Fold nested paper_reader (read_paper) usage into the subagent totals.
+    if checkpoint is not None:
+        reader_acc = cp.reader_usage()
     sub_tokens += reader_acc["tokens"]
     sub_calls += reader_acc["calls"]
     sub_parser_retries += reader_acc["parser_retries"]
@@ -841,3 +921,39 @@ async def run_ideation(
     log.close()
     client.close()
     return summary
+
+
+async def run_ideation(
+    problem: str | None,
+    run_dir: str | Path,
+    *,
+    model: str | None = None,
+    query_paper_id: Optional[int] = None,
+    max_turns: int | None = None,
+    max_sub_turns: int | None = None,
+    resume: bool = False,
+) -> dict:
+    """Run or resume ideation from durable model/tool call boundaries.
+
+    On resume, omitted arguments inherit the original run's configuration.
+    Explicit overrides must match. Keep code, environment, corpus and model
+    weights unchanged; credentials may be rotated. Old document-only runs
+    cannot be resumed.
+    """
+    with Checkpoint(run_dir, resume=resume) as cp:
+        original = (cp.get("config") or {}).get("arguments", {}) if resume else {}
+        supplied = dict(problem=problem, model=model, query_paper_id=query_paper_id,
+                        max_turns=max_turns, max_sub_turns=max_sub_turns)
+        defaults = dict(problem=None, model=os.environ.get("IDEASCIENTIST_MODEL", "Qwen3.6-27B"),
+                        query_paper_id=None, max_turns=100, max_sub_turns=40)
+        arguments = {k: v if v is not None else original.get(k, defaults[k])
+                     for k, v in supplied.items()}
+        if arguments["problem"] is None:
+            raise ValueError("A problem is required for a new run.")
+        cp.prepare({"version": 1, "arguments": arguments, "runtime": runtime_config()})
+        summary = cp.get("summary")
+        if summary is not None:
+            return summary
+        summary = await _run_ideation(run_dir=run_dir, checkpoint=cp.scope("orchestrator"), **arguments)
+        cp.set("summary", summary)
+        return summary

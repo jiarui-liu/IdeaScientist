@@ -64,20 +64,18 @@ def _slug(text: str) -> str:
 
 
 async def _run(args: argparse.Namespace) -> None:
-    problem = Path(args.problem_file).read_text(encoding="utf-8") if args.problem_file else args.problem
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.run_dir) / f"{ts}_{args.problem_id or _slug(problem)}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume:
+        run_dir = Path(args.resume)
+        problem = None
+    else:
+        problem = Path(args.problem_file).read_text(encoding="utf-8") if args.problem_file else args.problem
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(args.run_dir or "runs") / f"{ts}_{args.problem_id or _slug(problem)}"
     logger.info("run directory: %s", run_dir)
-
-
-    kwargs = {"max_turns": args.max_turns, "max_sub_turns": args.max_sub_turns}
-    if args.model:
-        kwargs["model"] = args.model
-    if args.query_paper_id:
-        kwargs["query_paper_id"] = args.query_paper_id
-
-    summary = await run_ideation(problem, run_dir, **kwargs)
+    summary = await run_ideation(
+        problem, run_dir, resume=bool(args.resume), model=args.model,
+        query_paper_id=args.query_paper_id, max_turns=args.max_turns,
+        max_sub_turns=args.max_sub_turns)
 
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -93,16 +91,20 @@ def main() -> None:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--problem", help="the research problem definition and challenge")
     src.add_argument("--problem-file", help="read the problem from a file instead")
+    src.add_argument("--resume", metavar="RUN_DIR", help="continue an existing checkpointed run")
     p.add_argument("--problem-id", default="", help="override the auto-derived run slug")
-    p.add_argument("--query-paper-id", type=int, default=0,
+    p.add_argument("--query-paper-id", type=int, default=None,
                    help="vault id of the target paper, used to exclude it from retrieval")
-    p.add_argument("--model", default="", help="model override (default: IDEASCIENTIST_MODEL)")
-    p.add_argument("--run-dir", default="runs", help="base directory for run outputs")
-    p.add_argument("--max-turns", type=int, default=100,
+    p.add_argument("--model", default=None, help="model override (default: IDEASCIENTIST_MODEL)")
+    p.add_argument("--run-dir", help="base directory for new runs (default: runs)")
+    p.add_argument("--max-turns", type=int, default=None,
                    help="orchestrator turn cap (paper setting: 100)")
-    p.add_argument("--max-sub-turns", type=int, default=40,
+    p.add_argument("--max-sub-turns", type=int, default=None,
                    help="per-sub-agent tool-use turn cap; per-role caps in tools.py bind first")
-    asyncio.run(_run(p.parse_args()))
+    args = p.parse_args()
+    if args.resume and (args.run_dir is not None or args.problem_id):
+        p.error("--resume uses its existing run directory; omit --run-dir and --problem-id")
+    asyncio.run(_run(args))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from ideascientist.harness.corpus import (
     keyword_search,
 )
 from ideascientist.harness.roles import ROLES
+from ideascientist.harness.checkpoint import CheckpointError
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ class ToolContext:
     # every other artifact belongs to the sub-agent that produces it. Reads are
     # never scoped — the orchestrator has to be able to see all of them.
     write_scope: Optional[frozenset] = None
+    checkpoint: Any = None  # per-invocation journal scope; absent in training
 
 
 def _log(ctx: ToolContext, kind: str, **kw: Any) -> None:
@@ -230,6 +232,8 @@ def _exec_read_paper(args: dict, ctx: ToolContext) -> str:
     if isinstance(goals, str):
         goals = [goals]
     _log(ctx, "tool:read_paper", paper_id=paper_id, n_goals=len(goals))
+    if ctx.checkpoint is not None:
+        return ctx.reader_fn(paper_id, list(goals), checkpoint=ctx.checkpoint)
     return ctx.reader_fn(paper_id, list(goals))
 
 
@@ -481,6 +485,16 @@ def _exec_edit_doc(args: dict, ctx: ToolContext) -> str:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
 
+    if ctx.checkpoint is not None:
+        def edit(writes):
+            def stage(path, text):
+                rel = _safe_path(root, path).relative_to(root.resolve()).as_posix()
+                writes[rel] = text
+            return _edit_doc_core(args, get, stage, write_scope=ctx.write_scope,
+                                  log=lambda **kw: _log(ctx, "tool:edit_doc", **kw))
+        return ctx.checkpoint.call("edit", [args, sorted(ctx.write_scope) if ctx.write_scope is not None else None],
+                                   edit, documents=True)
+
     return _edit_doc_core(
         args,
         get,
@@ -656,6 +670,8 @@ def run_tool(name: str, args: dict, ctx: ToolContext, tool_call_id: str = "") ->
     safe_args = coerce_tool_args(args)
     try:
         result = TOOLS[name].run(safe_args, ctx)
+    except CheckpointError:
+        raise
     except Exception as exc:  # noqa: BLE001 — per-tool-call robustness boundary
         result = f"(tool {name} error: {type(exc).__name__}: {exc})"
         import sys as _sys

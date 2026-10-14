@@ -159,6 +159,44 @@ the problem's own sub-field to find a transferable mechanism.
 python scripts/run_ideation.py --problem-file problem.txt --run-dir runs
 ```
 
+Every new run saves a call journal under `checkpoint/state.sqlite3`. To continue
+after an interruption, pass the exact run directory (not its parent):
+
+```bash
+python scripts/run_ideation.py --resume runs/<timestamp>_<slug>
+```
+
+The Python API also accepts `await run_ideation(None, run_dir, resume=True)`.
+Omitted arguments inherit the original problem, model and turn limits; explicit
+overrides must match. Resume reconstructs each agent's conversation and counters
+from recorded model replies, tool results, reader inputs and completion checks.
+Completed requests are not sent again, including those in parallel subagents.
+Document edits and their results commit together, so an interrupted `insert` or
+reader digest write is not applied twice. Resuming a completed run returns its
+saved summary without making calls.
+
+Keep the code, dependencies, Python major/minor version, behavior environment variables,
+corpus and served model weights unchanged. The runner checks code and settings,
+corpus paths/size/modification time, and previously written artifacts; it refuses
+detected changes instead of silently starting a different run. Corpus contents
+and remote model weights are not hashed. API keys are not saved in the run
+configuration and can be rotated. Only one process may own a run directory.
+Original logs are preserved; later attempts write to `logs/attempt_0002/`, etc.
+Runs created before this feature have no execution checkpoint and cannot resume.
+
+Recovery starts at successfully committed call boundaries. A request whose
+response was not committed may be sent again, even if the server already billed
+it. Live data changes and the scheduling of unfinished parallel work can still
+change subsequent results. On cancellation, the runner lets in-flight worker
+calls finish saving before closing the journal. Built-in document writes are
+transactional; arbitrary side effects in custom tools are not.
+
+Offline recovery tests (no API calls):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 | File | |
 |---|---|
 | `roles.py` | the five role prompts and their output schemas |
